@@ -1,3 +1,23 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>无人机空域协调台</title>
-<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#f3f6fa;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}pre{background:#101828;color:#fde68a;padding:16px;border-radius:8px;overflow:auto}input,button{font:inherit;padding:8px;margin:4px}button{background:#4338ca;color:white;border:0;border-radius:6px}</style>
-<h1>无人机空域协调台</h1><p>查看飞行计划与当前空域限制。提交、审核、变更和紧急授权通过 JSON API 完成。</p><section><input id="u" value="reviewer"><input id="r" value="airspace_reviewer"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#f3f6fa;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}pre{background:#101828;color:#fde68a;padding:16px;border-radius:8px;overflow:auto}input,button{font:inherit;padding:8px;margin:4px}button{background:#4338ca;color:white;border:0;border-radius:6px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #d7dee9;padding:6px 10px;text-align:left}th{background:#eef2f9}.ok{color:#15803d;font-weight:600}.full{color:#b91c1c;font-weight:600}</style>
+<h1>无人机空域协调台</h1><p>查看飞行计划、区域时段容量与当前空域限制。提交、审核、变更和紧急授权通过 JSON API 完成。</p>
+<section><input id="u" value="reviewer"><input id="r" value="airspace_reviewer"><input id="op" placeholder="X-Operator(运营方角色必填)"><button onclick="load()">刷新</button>
+<h2>区域时段容量</h2><div id="caps"></div>
+<h2>状态数据</h2><pre id="o"></pre></section>
+<script>
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function load(){
+  const headers={'X-User-Id':u.value,'X-Role':r.value};if(op.value)headers['X-Operator']=op.value;
+  const x=await fetch('/api/state',{headers});const data=await x.json();
+  o.textContent=JSON.stringify(data,null,2);renderCaps(data.capacities||[]);
+}
+function renderCaps(list){
+  if(!list.length){caps.innerHTML='<p>当前没有区域容量规则，空域审核员可通过 POST /api/capacities 设置。</p>';return}
+  const rows=list.map(c=>{
+    const occ=(c.occupants||[]).map(p=>esc(p.callsign)+'('+esc(p.operator_id)+')').join(', ')||'—';
+    return '<tr><td>'+esc(c.region)+'</td><td>'+esc(c.starts_at)+' ~ '+esc(c.ends_at)+'</td><td>'+c.max_allowed+'</td><td>'+c.used+'</td><td class="'+(c.remaining>0?'ok':'full')+'">'+c.remaining+'</td><td>'+occ+'</td></tr>';
+  }).join('');
+  caps.innerHTML='<table><tr><th>区域</th><th>时段(UTC)</th><th>放行上限</th><th>已占用</th><th>剩余名额</th><th>占用计划</th></tr>'+rows+'</table>';
+}
+load()
+</script>

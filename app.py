@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 PORT = 8205
 ROLES = {"viewer", "operator", "airspace_reviewer", "commander", "auditor"}
@@ -77,6 +77,10 @@ class Repository:
             reviewer TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT NOT NULL, offline_id TEXT UNIQUE,
             override_kind TEXT, created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS region_capacities(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, region TEXT NOT NULL, starts_at TEXT NOT NULL, ends_at TEXT NOT NULL,
+            max_allowed INTEGER NOT NULL, note TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL, created_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS notifications(
             id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL REFERENCES flight_plans(id), kind TEXT NOT NULL,
             message TEXT NOT NULL, created_at TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0
@@ -132,10 +136,63 @@ class DroneAirspaceService:
                                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (name, kind, min_lon, min_lat, max_lon, max_lat, min_alt, max_alt, iso(start), iso(end), reason, iso()))
             return dict(conn.execute("SELECT * FROM restrictions WHERE id=?", (cur.lastrowid,)).fetchone())
 
+    def create_capacity(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"airspace_reviewer", "commander"}: raise ApiError(403, "capacity_forbidden", "只有空域审核员或指挥官可以设置区域容量")
+        region, note = str(body.get("region", "")).strip(), str(body.get("note", "")).strip()
+        max_allowed = body.get("max_allowed")
+        if not region: raise ApiError(400, "invalid_capacity", "区域名称必填")
+        if not isinstance(max_allowed, int) or isinstance(max_allowed, bool) or not 1 <= max_allowed <= 1000:
+            raise ApiError(400, "invalid_capacity", "max_allowed 必须是 1 到 1000 的整数")
+        start, end = parse_time(body.get("starts_at")), parse_time(body.get("ends_at"))
+        if end <= start: raise ApiError(400, "invalid_capacity", "容量时段结束必须晚于开始")
+        with self.repo.tx() as conn:
+            cur = conn.execute("INSERT INTO region_capacities(region,starts_at,ends_at,max_allowed,note,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                               (region, iso(start), iso(end), max_allowed, note, actor, iso()))
+            Repository.audit(conn, None, actor, role, "capacity_created", {"capacity_id": cur.lastrowid, "region": region, "max_allowed": max_allowed, "starts_at": iso(start), "ends_at": iso(end)})
+            row = conn.execute("SELECT * FROM region_capacities WHERE id=?", (cur.lastrowid,)).fetchone()
+            return self._capacity_view(conn, row, role)
+
+    def list_capacities(self, role: str, params: dict[str, str]) -> dict[str, Any]:
+        region = str(params.get("region", "")).strip()
+        start_raw, end_raw = str(params.get("starts_at", "")).strip(), str(params.get("ends_at", "")).strip()
+        if bool(start_raw) != bool(end_raw): raise ApiError(400, "invalid_time_filter", "starts_at 和 ends_at 必须同时提供")
+        clauses, args = [], []
+        if region: clauses.append("region=?"); args.append(region)
+        if start_raw:
+            start, end = parse_time(start_raw), parse_time(end_raw)
+            if end <= start: raise ApiError(400, "invalid_time_filter", "查询时段结束必须晚于开始")
+            clauses.append("starts_at<? AND ends_at>?"); args.extend([iso(end), iso(start)])
+        sql = "SELECT * FROM region_capacities" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY starts_at DESC, id DESC"
+        conn = self.repo.conn
+        return {"capacities": [self._capacity_view(conn, row, role) for row in conn.execute(sql, args)], "server_time": iso()}
+
+    @staticmethod
+    def _capacity_view(conn: sqlite3.Connection, cap: sqlite3.Row, role: str) -> dict[str, Any]:
+        occupants = list(conn.execute("""SELECT id,callsign,operator_id,starts_at,ends_at FROM flight_plans
+                                         WHERE status='approved' AND region=? AND starts_at<? AND ends_at>? ORDER BY id""",
+                                      (cap["region"], cap["ends_at"], cap["starts_at"])))
+        view = {"id": cap["id"], "region": cap["region"], "starts_at": cap["starts_at"], "ends_at": cap["ends_at"],
+                "max_allowed": cap["max_allowed"], "used": len(occupants), "remaining": cap["max_allowed"] - len(occupants), "note": cap["note"]}
+        if role in {"airspace_reviewer", "commander", "auditor"}: view["occupants"] = [dict(r) for r in occupants]
+        return view
+
+    @staticmethod
+    def _plan_capacity(conn: sqlite3.Connection, plan: sqlite3.Row) -> list[dict[str, Any]]:
+        result = []
+        for cap in conn.execute("SELECT * FROM region_capacities WHERE region=? AND starts_at<? AND ends_at>?", (plan["region"], plan["ends_at"], plan["starts_at"])):
+            used = conn.execute("""SELECT COUNT(*) AS c FROM flight_plans
+                                   WHERE status='approved' AND id!=? AND region=? AND starts_at<? AND ends_at>?""",
+                                (plan["id"], cap["region"], cap["ends_at"], cap["starts_at"])).fetchone()["c"]
+            result.append({"capacity_id": cap["id"], "region": cap["region"], "starts_at": cap["starts_at"], "ends_at": cap["ends_at"],
+                           "max_allowed": cap["max_allowed"], "used": used, "remaining": cap["max_allowed"] - used})
+        return result
+
     def create_plan(self, actor: str, role: str, operator: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "operator": raise ApiError(403, "plan_forbidden", "只有运营方可以创建飞行计划")
         required = ("callsign", "drone_model", "starts_at", "ends_at", "emergency_plan", "region")
         if any(body.get(key) in (None, "") for key in required): raise ApiError(400, "missing_fields", "飞行计划字段不完整")
+        region = str(body["region"]).strip()
+        if not region: raise ApiError(400, "missing_fields", "飞行计划字段不完整")
         route = validate_route(body.get("route")); start, end = parse_time(body["starts_at"]), parse_time(body["ends_at"])
         try: payload, altitude = float(body.get("payload_kg")), float(body.get("max_altitude"))
         except (TypeError, ValueError): raise ApiError(400, "invalid_numbers", "payload_kg 和 max_altitude 必须为数字")
@@ -148,7 +205,7 @@ class DroneAirspaceService:
             try:
                 cur = conn.execute("""INSERT INTO flight_plans(operator_id,callsign,drone_model,payload_kg,route_json,starts_at,ends_at,max_altitude,population_risk,emergency_plan,region,created_by,created_at,updated_at)
                                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                   (operator, str(body["callsign"]).upper(), body["drone_model"], payload, json.dumps(route), iso(start), iso(end), altitude, risk, body["emergency_plan"], body["region"], actor, iso(), iso()))
+                                   (operator, str(body["callsign"]).upper(), body["drone_model"], payload, json.dumps(route), iso(start), iso(end), altitude, risk, body["emergency_plan"], region, actor, iso(), iso()))
             except sqlite3.IntegrityError as exc: raise ApiError(409, "plan_duplicate", "同一运营方、呼号和起飞时间的计划已存在") from exc
             plan_id = cur.lastrowid; Repository.audit(conn, plan_id, actor, role, "plan_created", {"bbox": bbox, "revision": 1})
             return self.get_plan(plan_id, role, operator)
@@ -187,7 +244,9 @@ class DroneAirspaceService:
             if boxes_overlap(bbox, route_bbox(self._route(other)), 0.002):
                 adjacent.append({"plan_id": other["id"], "callsign": other["callsign"], "operator_id": other["operator_id"], "status": other["status"], "starts_at": other["starts_at"], "ends_at": other["ends_at"]})
         if adjacent: blocking.append({"code": "adjacent_traffic", "plans": adjacent, "message": "相邻航路与有效计划重叠"})
-        return {"plan_id": plan["id"], "revision": plan["revision"], "hard_violations": hard, "blocking_conflicts": blocking, "approvable": not hard and not blocking}
+        capacity = self._plan_capacity(conn, plan); capacity_ok = all(item["remaining"] > 0 for item in capacity)
+        return {"plan_id": plan["id"], "revision": plan["revision"], "hard_violations": hard, "blocking_conflicts": blocking,
+                "capacity": capacity, "capacity_ok": capacity_ok, "approvable": not hard and not blocking and capacity_ok}
 
     def get_plan(self, plan_id: int, role: str, operator: str = "") -> dict[str, Any]:
         conn = self.repo.conn; row = self._plan_row(conn, plan_id)
@@ -227,6 +286,7 @@ class DroneAirspaceService:
             if plan["revision"] != expected: raise ApiError(409, "revision_conflict", "计划版本已变化，审核决定不能套用")
             report = self._conflict_report(conn, plan)
             if report["hard_violations"]: raise ApiError(409, "hard_constraint_violation", "计划违反不可覆盖的安全约束", report)
+            if not report["capacity_ok"]: raise ApiError(409, "capacity_full", "区域时段容量已满，无法批准", {"capacity": report["capacity"]})
             if report["blocking_conflicts"] and not (role == "commander" and override):
                 raise ApiError(409, "airspace_conflict", "计划存在空域或相邻交通冲突", report)
             override_kind = "emergency_authority" if report["blocking_conflicts"] else None
@@ -272,9 +332,9 @@ class DroneAirspaceService:
             if not 0 <= payload <= 25 or altitude <= 0 or not isinstance(risk, int) or not 0 <= risk <= 5: raise ApiError(400, "invalid_plan", "变更后的载荷、高度或风险无效")
             revision = expected + 1
             conn.execute("""UPDATE flight_plans SET route_json=?,starts_at=?,ends_at=?,payload_kg=?,max_altitude=?,population_risk=?,emergency_plan=?,region=?,status='draft',revision=?,updated_at=? WHERE id=?""",
-                         (json.dumps(route), iso(start), iso(end), payload, altitude, risk, body.get("emergency_plan", plan["emergency_plan"]), body.get("region", plan["region"]), revision, iso(), plan_id))
-            Repository.audit(conn, plan_id, actor, role, "plan_changed", {"from_revision": expected, "to_revision": revision, "previous_status": plan["status"]})
-            if plan["status"] == "approved": Repository.notify(conn, plan_id, "approval_invalidated", f"飞行计划 {plan['callsign']} 已修改，原批准自动失效")
+                         (json.dumps(route), iso(start), iso(end), payload, altitude, risk, body.get("emergency_plan", plan["emergency_plan"]), str(body.get("region") or plan["region"]).strip(), revision, iso(), plan_id))
+            Repository.audit(conn, plan_id, actor, role, "plan_changed", {"from_revision": expected, "to_revision": revision, "previous_status": plan["status"], "capacity_released": plan["status"] == "approved"})
+            if plan["status"] == "approved": Repository.notify(conn, plan_id, "approval_invalidated", f"飞行计划 {plan['callsign']} 已修改，原批准自动失效，所占区域容量名额已释放")
             else: Repository.notify(conn, plan_id, "changed", f"飞行计划 {plan['callsign']} 已更新，需重新提交审核")
             return self.get_plan(plan_id, role, operator)
 
@@ -288,8 +348,10 @@ class DroneAirspaceService:
             if plan["status"] == "canceled": return {"plan": self.get_plan(plan_id, role, operator), "idempotent": True}
             if plan["status"] == "expired": raise ApiError(409, "plan_expired", "已过期计划不能取消")
             conn.execute("UPDATE flight_plans SET status='canceled',updated_at=? WHERE id=?", (iso(), plan_id))
-            Repository.audit(conn, plan_id, actor, role, "plan_canceled", {"reason": reason})
-            Repository.notify(conn, plan_id, "canceled", f"飞行计划 {plan['callsign']} 已取消：{reason}")
+            Repository.audit(conn, plan_id, actor, role, "plan_canceled", {"reason": reason, "capacity_released": plan["status"] == "approved"})
+            message = f"飞行计划 {plan['callsign']} 已取消：{reason}"
+            if plan["status"] == "approved": message += "，所占区域容量名额已释放"
+            Repository.notify(conn, plan_id, "canceled", message)
             return {"plan": self.get_plan(plan_id, role, operator), "idempotent": False}
 
     def notifications(self, actor: str, role: str, operator: str) -> dict[str, Any]:
@@ -306,8 +368,8 @@ class DroneAirspaceService:
             rows = list(conn.execute("SELECT * FROM flight_plans WHERE status='approved' AND ends_at<=?", (now,)))
             for row in rows:
                 conn.execute("UPDATE flight_plans SET status='expired',updated_at=? WHERE id=?", (now, row["id"]))
-                Repository.audit(conn, row["id"], actor, role, "plan_expired", {})
-                Repository.notify(conn, row["id"], "expired", f"飞行计划 {row['callsign']} 已过期")
+                Repository.audit(conn, row["id"], actor, role, "plan_expired", {"capacity_released": True})
+                Repository.notify(conn, row["id"], "expired", f"飞行计划 {row['callsign']} 已过期，所占区域容量名额已释放")
         return {"expired": len(rows)}
 
     def state(self, role: str, operator: str) -> dict[str, Any]:
@@ -319,7 +381,8 @@ class DroneAirspaceService:
         for row in rows:
             item = self.get_plan(row["id"], role, operator); plans.append(item)
         restrictions = [dict(r) for r in conn.execute("SELECT * FROM restrictions WHERE status='active' ORDER BY id DESC")] if role in {"airspace_reviewer", "commander", "auditor"} else []
-        return {"plans": plans, "restrictions": restrictions, "server_time": iso()}
+        capacities = [self._capacity_view(conn, row, role) for row in conn.execute("SELECT * FROM region_capacities ORDER BY starts_at DESC, id DESC")]
+        return {"plans": plans, "restrictions": restrictions, "capacities": capacities, "server_time": iso()}
 
 
 def send_json(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
@@ -336,11 +399,12 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError as exc: raise ApiError(400, "invalid_json", "请求体不是有效 JSON") from exc
         if not isinstance(value, dict): raise ApiError(400, "invalid_json", "请求体必须是对象")
         return value
-    def get_api(self, path: str) -> tuple[int, Any]:
+    def get_api(self, path: str, query: dict[str, str]) -> tuple[int, Any]:
         if path == "/health": return 200, {"status": "ok", "service": "drone-airspace"}
         actor, role, operator = self.service.identity(self.headers)
         if path == "/api/state": return 200, self.service.state(role, operator)
         if path == "/api/notifications": return 200, self.service.notifications(actor, role, operator)
+        if path == "/api/capacities": return 200, self.service.list_capacities(role, query)
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "plans"] and parts[2].isdigit(): return 200, self.service.get_plan(int(parts[2]), role, operator)
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit() and parts[3] == "check": return 200, self.service.check_conflicts(int(parts[2]), role, operator)
@@ -348,6 +412,7 @@ class Handler(BaseHTTPRequestHandler):
     def post_api(self, path: str) -> tuple[int, Any]:
         actor, role, operator = self.service.identity(self.headers); body = self.body(); parts = [p for p in path.split("/") if p]
         if path == "/api/restrictions": return 201, self.service.create_restriction(actor, role, body)
+        if path == "/api/capacities": return 201, self.service.create_capacity(actor, role, body)
         if path == "/api/plans": return 201, self.service.create_plan(actor, role, operator, body)
         if path == "/api/expire": return 200, self.service.expire_plans(actor, role)
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit():
@@ -366,7 +431,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if method == "GET" and parsed.path == "/":
                 raw = (self.web_root / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw); return
-            status, payload = self.get_api(parsed.path) if method == "GET" else self.post_api(parsed.path); send_json(self, status, payload)
+            query = {key: values[0] for key, values in parse_qs(parsed.query).items()}
+            status, payload = self.get_api(parsed.path, query) if method == "GET" else self.post_api(parsed.path); send_json(self, status, payload)
         except ApiError as exc:
             payload = {"error": exc.code, "message": exc.message}
             if exc.details is not None: payload["details"] = exc.details
