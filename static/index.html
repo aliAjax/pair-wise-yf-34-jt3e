@@ -1,3 +1,104 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>无人机空域协调台</title>
-<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#f3f6fa;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}pre{background:#101828;color:#fde68a;padding:16px;border-radius:8px;overflow:auto}input,button{font:inherit;padding:8px;margin:4px}button{background:#4338ca;color:white;border:0;border-radius:6px}</style>
-<h1>无人机空域协调台</h1><p>查看飞行计划与当前空域限制。提交、审核、变更和紧急授权通过 JSON API 完成。</p><section><input id="u" value="reviewer"><input id="r" value="airspace_reviewer"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<style>
+body{font:15px system-ui;max-width:1200px;margin:32px auto;background:#f3f6fa;padding:0 20px;color:#172033}
+section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}
+pre{background:#101828;color:#fde68a;padding:16px;border-radius:8px;overflow:auto;max-height:420px}
+input,button,select{font:inherit;padding:8px;margin:4px}
+button{background:#4338ca;color:white;border:0;border-radius:6px;cursor:pointer}
+button.secondary{background:#0f766e}
+table{border-collapse:collapse;width:100%;margin-top:8px}
+th,td{border:1px solid #e2e8f0;padding:8px 10px;text-align:left;font-size:14px}
+th{background:#eef2ff}
+.full{background:#fee2e2;color:#991b1b;font-weight:600}
+.near{background:#fef9c3;color:#854d0e}
+.tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;background:#e0e7ff;color:#3730a3;margin-right:6px}
+.muted{color:#64748b;font-size:13px}
+#capForm{display:none;grid-template-columns:repeat(6,1fr);gap:8px;align-items:end}
+</style>
+<h1>无人机空域协调台</h1>
+<p>查看飞行计划与区域时段容量。运营方可查询剩余名额，空域审核员可设置容量并在批准时自动占用名额。</p>
+<section>
+  <label>用户 <input id="u" value="reviewer"></label>
+  <label>角色 <select id="r" onchange="toggleCapForm()">
+    <option value="airspace_reviewer" selected>airspace_reviewer 空域审核员</option>
+    <option value="operator">operator 运营方</option>
+    <option value="commander">commander 指挥官</option>
+    <option value="auditor">auditor 审计员</option>
+    <option value="viewer">viewer 公众</option>
+  </select></label>
+  <label id="opWrap" style="display:none">运营方 <input id="op" value="OP1"></label>
+  <button onclick="load()">刷新</button>
+  <span class="muted" id="clock"></span>
+</section>
+
+<section id="capSection">
+  <h2>区域时段容量与占用</h2>
+  <div id="capForm">
+    <label>区域<input id="cRegion" value="BJ"></label>
+    <label>最多放行(架)<input id="cSlots" type="number" min="1" value="2"></label>
+    <label>开始<input id="cStart" type="datetime-local"></label>
+    <label>结束<input id="cEnd" type="datetime-local"></label>
+    <label>备注<input id="cNote" placeholder="演练/活动"></label>
+    <button class="secondary" onclick="createCapacity()">设置容量</button>
+  </div>
+  <p class="muted" id="capHint"></p>
+  <table id="capTable"><thead><tr>
+    <th>区域</th><th>时段</th><th>容量</th><th>已占用</th><th>剩余</th><th>占用中的已批准计划</th><th>备注</th>
+  </tr></thead><tbody></tbody></table>
+</section>
+
+<section>
+  <h2>飞行计划</h2>
+  <pre id="o">加载中…</pre>
+</section>
+
+<script>
+let DATA=null;
+function headers(){let h={'X-User-Id':u.value,'X-Role':r.value};if(r.value==='operator')h['X-Operator']=op.value;return h;}
+function toggleCapForm(){
+  opWrap.style.display=r.value==='operator'?'inline':'none';
+  capForm.style.display=['airspace_reviewer','commander'].includes(r.value)?'grid':'none';
+  capHint.textContent={
+    airspace_reviewer:'可新增区域时段容量；批准计划时自动占用名额，容量满将拒绝批准。',
+    commander:'与审核员相同；容量满时可用紧急授权超额放行（留痕）。',
+    operator:'可查询各区域时段剩余名额；占用方信息不公开。',
+    auditor:'只读查看容量与占用明细。',
+    viewer:'仅查看公开的容量与剩余数。'
+  }[r.value]||'';
+}
+function localIso(d){return d.toISOString().slice(0,16);}
+async function api(path,opts){let x=await fetch(path,Object.assign({headers:headers()},opts||{}));return {status:x.status,body:await x.json()};}
+async function load(){
+  let r=await api('/api/state');DATA=r.body;
+  clock.textContent='服务器时间 '+(DATA.server_time||'');
+  renderCapacities(DATA.capacities||[]);
+  o.textContent=JSON.stringify(DATA.plans,null,2);
+}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function renderCapacities(caps){
+  let tb=capTable.querySelector('tbody');tb.innerHTML='';
+  if(!caps.length){tb.innerHTML='<tr><td colspan="7" class="muted">暂无容量设置；未设置容量的区域时段不做名额限制。</td></tr>';return;}
+  for(let c of caps){
+    let cls=c.remaining_slots===0?'full':(c.remaining_slots<=Math.ceil(c.max_slots*0.2)?'near':'');
+    let occ=(c.occupying_plans||[]).map(p=>`<span class="tag">#${p.plan_id} ${esc(p.callsign)} · ${esc(p.operator_id)}<br>${esc(p.starts_at)}~${esc(p.ends_at)}</span>`).join('');
+    if(!occ)occ='<span class="muted">—</span>';
+    if(!('occupying_plans' in c))occ='<span class="muted">占用明细仅审核方可见</span>';
+    tb.innerHTML+=`<tr class="${cls}">
+      <td>${esc(c.region)}</td><td>${esc(c.starts_at)}<br>~ ${esc(c.ends_at)}</td>
+      <td>${c.max_slots}</td><td>${c.used_slots}</td><td><strong>${c.remaining_slots}</strong></td>
+      <td>${occ}</td><td>${esc(c.note)}</td></tr>`;
+  }
+}
+async function createCapacity(){
+  let body={region:cRegion.value,max_slots:parseInt(cSlots.value,10),
+    starts_at:cStart.value?new Date(cStart.value).toISOString():null,
+    ends_at:cEnd.value?new Date(cEnd.value).toISOString():null,note:cNote.value};
+  let r=await api('/api/capacities',{method:'POST',headers:Object.assign(headers(),{'Content-Type':'application/json'}),body:JSON.stringify(body)});
+  alert(r.status===201?`容量已设置：#${r.body.id} ${r.body.region}`+` 剩余 ${r.body.remaining_slots}/${r.body.max_slots}`:('失败：'+r.body.message));
+  load();
+}
+(function(){
+  let now=new Date();cStart.value=localIso(now);cEnd.value=localIso(new Date(now.getTime()+4*3600*1000));
+  toggleCapForm();load();
+})();
+</script>
